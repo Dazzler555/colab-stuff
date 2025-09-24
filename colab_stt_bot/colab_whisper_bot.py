@@ -526,17 +526,11 @@ class ColabWhisperBot:
             
             processing_time = time.time() - start_time
             caption = (
-                f"✅ **Transcription Complete**
-
-"
-                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})
-"
-                f"**Model:** `{self.model_manager.current_model_name}`
-"
-                f"**Duration:** `{timedelta(seconds=int(info.duration))}`
-"
-                f"**Processing Time:** `{processing_time:.1f}s`
-"
+                f"✅ **Transcription Complete**"
+                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})"
+                f"**Model:** `{self.model_manager.current_model_name}`"
+                f"**Duration:** `{timedelta(seconds=int(info.duration))}`"
+                f"**Processing Time:** `{processing_time:.1f}s`"
                 f"{'**Prompt:** Provided' if initial_prompt else ''}"
             ).strip()
             
