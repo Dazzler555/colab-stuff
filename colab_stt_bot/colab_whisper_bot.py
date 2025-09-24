@@ -498,7 +498,7 @@ class ColabWhisperBot:
 
     async def _transcribe_audio_realtime(self, audio_path: str, language: Optional[str], initial_prompt: Optional[str]) -> AsyncGenerator[Tuple[Any, Any], None]:
         """Transcribes with accuracy-focused settings and yields segments in real-time."""
-        # Hallmark settings for high accuracy and anti-hallucination
+        # Hallmark settings with STRICTER anti-hallucination filters
         segments, info = self.model_manager.current_model.transcribe(
             audio_path,
             beam_size=5,
@@ -506,14 +506,15 @@ class ColabWhisperBot:
             vad_parameters=dict(min_silence_duration_ms=500),
             language=language,
             initial_prompt=initial_prompt,
-            # --- SETTINGS TO PREVENT REPETITION & HALLUCINATIONS ---
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
+            # --- STRONGER SETTINGS TO PREVENT REPETITION ---
+            compression_ratio_threshold=2.0,  # Lowered from 2.4 to be more strict
+            log_prob_threshold=-0.9,          # Raised from -1.0 to be more strict
             no_speech_threshold=0.6
         )
         for segment in segments:
             yield segment, info
+
 
     def _format_output(self, text: str, info, format_type: str) -> str:
         """Formats the transcription segments into plain text or SRT."""
