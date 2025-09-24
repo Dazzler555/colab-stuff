@@ -1,5 +1,5 @@
 # Enhanced Telegram Whisper Bot - Google Colab Version
-# v5: Real-time progress, YouTube support, custom models, and refined accuracy controls.
+# v6: Final version with anti-repetition filters and all previous fixes.
 
 import os
 import sys
@@ -498,14 +498,19 @@ class ColabWhisperBot:
 
     async def _transcribe_audio_realtime(self, audio_path: str, language: Optional[str], initial_prompt: Optional[str]) -> AsyncGenerator[Tuple[Any, Any], None]:
         """Transcribes with accuracy-focused settings and yields segments in real-time."""
-        # Hallmark settings for high accuracy
+        # Hallmark settings for high accuracy and anti-hallucination
         segments, info = self.model_manager.current_model.transcribe(
             audio_path,
             beam_size=5,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
             language=language,
-            initial_prompt=initial_prompt
+            initial_prompt=initial_prompt,
+            # --- SETTINGS TO PREVENT REPETITION & HALLUCINATIONS ---
+            temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.6
         )
         for segment in segments:
             yield segment, info
@@ -537,7 +542,7 @@ class ColabWhisperBot:
 # --- Main Execution ---
 async def main():
     """Initializes and runs the bot, handling the main lifecycle."""
-    print("🔥 Enhanced Telegram Whisper Bot - Colab Edition v5")
+    print("🔥 Enhanced Telegram Whisper Bot - Colab Edition v6")
     bot_instance = None
     try:
         config = await initialize_config()
@@ -560,3 +565,4 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     # Run the main asynchronous event loop
     asyncio.run(main())
+
