@@ -231,6 +231,7 @@ class ColabModelManager:
             "small": "Good balance of speed and accuracy",
             "medium": "High accuracy, slower",
             "large-v3": "Best accuracy, default",
+            "large-v3-turbo": "Fast with high accuracy, newest model"  # New addition
         }
 
     async def load_model(self, model_name_or_path: str) -> WhisperModel:
@@ -573,6 +574,7 @@ class ColabWhisperBot:
         segments, info = self.model_manager.current_model.transcribe(
             audio_path,
             beam_size=5,
+            multilingual=True,
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500),
             language=language,
