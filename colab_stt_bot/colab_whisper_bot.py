@@ -321,7 +321,7 @@ class ColabWhisperBot:
         self.app = Client("colab_whisper_bot", api_id=config.api_id, api_hash=config.api_hash,
                           bot_token=config.bot_token, workdir="/content")
         self._setup_handlers()
-        print("🤖 Bot initialized successfully!")
+        print("🤖 Bot class initialized successfully!")
 
     def _setup_handlers(self):
         self.app.on_message(filters.command("start"))(self.handle_start)
@@ -544,12 +544,13 @@ class ColabWhisperBot:
                 return await self._download_youtube(message.text.strip())
             return None
 
-        if media.file_size > self.config.max_file_size:
+        if hasattr(media, 'file_size') and media.file_size > self.config.max_file_size:
             raise ValueError(f"File is too large ({media.file_size / 1024**2:.1f}MB). Max is {self.config.max_file_size / 1024**2}MB.")
 
         temp_path = await client.download_media(message, file_name=f"{self.config.temp_dir}/{uuid.uuid4()}")
         file_hash = hashlib.md5(Path(temp_path).read_bytes()).hexdigest()
-        return temp_path, file_hash, media.file_size
+        file_size = os.path.getsize(temp_path)
+        return temp_path, file_hash, file_size
 
     async def _download_youtube(self, url: str):
         temp_id = uuid.uuid4().hex
@@ -607,32 +608,45 @@ class ColabWhisperBot:
         ms = int((seconds % 1) * 1000)
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
+    # THIS METHOD IS MODIFIED
     async def run(self):
-        print("🚀 Starting Colab Whisper Bot...")
-        try:
-            await self.app.start()
-            me = await self.app.get_me()
-            print(f"✅ Bot started as @{me.username}!")
-            print("🤖 Send /start to begin. Keep this Colab cell running.")
-            await self.app.idle()
-        except Exception as e:
-            logging.error(f"Bot run error: {e}")
-        finally:
-            await self.app.stop()
-            print("👋 Bot stopped.")
+        """Starts the bot client and prints status."""
+        print("🚀 Starting Bot Client...")
+        await self.app.start()
+        me = await self.app.get_me()
+        print(f"✅ Bot started as @{me.username}!")
+        print("🤖 Send /start to begin. Keep this Colab cell running.")
+
 
 # --- Main Execution ---
+# THIS FUNCTION IS MODIFIED
 async def main():
+    """Initializes and runs the bot, handling the main lifecycle."""
     print("🔥 Enhanced Telegram Whisper Bot - Colab Edition")
     print("=" * 60)
+    bot_instance = None
     try:
+        # Initialize configuration and bot instance
         config = await initialize_config()
-        bot = ColabWhisperBot(config)
-        await bot.run()
+        bot_instance = ColabWhisperBot(config)
+
+        # Start the bot
+        await bot_instance.run()
+
+        # Keep the script running indefinitely until interrupted
+        await asyncio.Event().wait()
+
+    except (KeyboardInterrupt, SystemExit):
+        print("\n🛑 Bot shutdown requested.")
     except Exception as e:
         print(f"❌ A critical startup error occurred: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        if bot_instance and bot_instance.app.is_connected:
+            print("👋 Stopping bot...")
+            await bot_instance.app.stop()
+            print("✅ Bot stopped.")
 
 if __name__ == "__main__":
     try:
@@ -643,4 +657,3 @@ if __name__ == "__main__":
     
     # Run the main asynchronous function
     asyncio.run(main())
-
