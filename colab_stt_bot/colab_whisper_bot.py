@@ -448,17 +448,18 @@ class ColabWhisperBot:
 
             await status_msg.edit_text("🧠 Transcribing & Punctuating...")
             
-            # --- NEW: LOGIC FOR INTELLIGENT PUNCTUATION ---
+            # --- NEW: LOGIC FOR INTELLIGENT PUNCTUATION v2 ---
             words = []
             info = None
             async for segment, transcription_info in self._transcribe_audio_realtime(wav_path, language=language, initial_prompt=initial_prompt):
                 if info is None: info = transcription_info
-                for word in segment.words:
-                    words.append(word)
+                if segment.words:
+                    for word in segment.words:
+                        words.append(word)
 
             punctuated_text = ""
             if words:
-                # Capitalize the first word
+                # Capitalize the first word, cleaning it first
                 punctuated_text += words[0].word.strip().capitalize()
 
                 for i in range(1, len(words)):
@@ -466,17 +467,19 @@ class ColabWhisperBot:
                     curr_word = words[i]
                     
                     pause_duration = curr_word.start - prev_word.end
+                    word_text = curr_word.word.strip()
                     
                     # Define a pause threshold for a new sentence (e.g., 0.7 seconds)
                     if pause_duration > 0.7:
-                        punctuated_text += "."
-                        punctuated_text += " " + curr_word.word.strip().capitalize()
+                        # Clean up previous text before adding a period
+                        punctuated_text = punctuated_text.rstrip(' ,.;')
+                        punctuated_text += ". " + word_text.capitalize()
                     else:
-                        punctuated_text += " " + curr_word.word.strip()
+                        punctuated_text += " " + word_text
                 
-                # Add a final period if it's missing
-                if not punctuated_text.endswith('.'):
-                    punctuated_text += "."
+                # Add a final period after cleaning up any trailing punctuation
+                punctuated_text = punctuated_text.rstrip(' ,.;')
+                punctuated_text += "."
 
             full_text = punctuated_text
             # --- END OF NEW LOGIC ---
