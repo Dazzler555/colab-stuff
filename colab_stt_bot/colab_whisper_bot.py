@@ -55,7 +55,7 @@ from pyrogram.types import (
 )
 from pyrogram.errors import FloodWait
 
-from faster_whisper import WhisperModel, VadOptions
+from faster_whisper import WhisperModel
 import yt_dlp
 import torch
 
