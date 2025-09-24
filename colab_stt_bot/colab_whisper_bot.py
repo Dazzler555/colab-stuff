@@ -270,6 +270,12 @@ class ColabWhisperBot:
         self._setup_handlers()
         print("🤖 Bot class initialized successfully!")
 
+    def _create_progress_bar(self, percent: float, length: int = 20) -> str:
+        """Creates a visual progress bar string"""
+        filled = int(length * percent / 100)
+        bar = "█" * filled + "░" * (length - filled)
+        return f"`[{bar}]`"
+
     def _setup_handlers(self):
         """A streamlined method to register all message and callback handlers."""
         self.app.on_message(filters.command("start"))(self.handle_start)
@@ -431,9 +437,40 @@ class ColabWhisperBot:
             await status_message.edit_text(f"❌ **Error:** {str(e)}")
 
     async def _process_media_file(self, message: Message, file_path: str, status_msg: Message, command: str, initial_prompt: Optional[str], language: Optional[str]):
-        """Core logic for processing a local media file with intelligent punctuation."""
+        """Core logic for processing a local media file with progress updates."""
         start_time = time.time()
         temp_path = Path(file_path)
+        last_update_time = 0
+        
+        async def update_progress(percent, processed_time, total_duration):
+            """Update progress in Telegram message"""
+            nonlocal last_update_time
+            current_time = time.time()
+            
+            # Update every 2 seconds to avoid rate limits
+            if current_time - last_update_time >= 2:
+                progress_bar = self._create_progress_bar(percent)
+                time_str = f"{int(processed_time//60):02d}:{int(processed_time%60):02d} / {int(total_duration//60):02d}:{int(total_duration%60):02d}"
+                
+                progress_text = (
+                    f"🧠 **Transcribing Audio**
+
+"
+                    f"{progress_bar} {percent:.1f}%
+"
+                    f"⏱️ **Time:** {time_str}
+"
+                    f"🤖 **Model:** `{self.model_manager.current_model_name}`"
+                )
+                
+                try:
+                    await status_msg.edit_text(progress_text, parse_mode=enums.ParseMode.MARKDOWN)
+                    last_update_time = current_time
+                except Exception as e:
+                    # Ignore rate limit errors during progress updates
+                    if "Too Many Requests" not in str(e):
+                        logging.warning(f"Progress update error: {e}")
+        
         try:
             file_hash = hashlib.md5(temp_path.read_bytes()).hexdigest()
             file_size = temp_path.stat().st_size
@@ -446,69 +483,79 @@ class ColabWhisperBot:
                 user_model = user_data.get('preferred_model', 'large-v3')
                 await self.model_manager.load_model(user_model)
 
-            await status_msg.edit_text("🧠 Transcribing & Punctuating...")
+            await status_msg.edit_text("🧠 Starting transcription...")
             
-            # --- NEW: LOGIC FOR INTELLIGENT PUNCTUATION v2 ---
+            # Enhanced transcription with progress tracking
             words = []
             info = None
-            async for segment, transcription_info in self._transcribe_audio_realtime(wav_path, language=language, initial_prompt=initial_prompt):
-                if info is None: info = transcription_info
+            async for segment, transcription_info in self._transcribe_audio_realtime(
+                wav_path, 
+                language=language, 
+                initial_prompt=initial_prompt,
+                progress_callback=update_progress
+            ):
+                if info is None: 
+                    info = transcription_info
                 if segment.words:
                     for word in segment.words:
                         words.append(word)
 
+            # Final progress update
+            await status_msg.edit_text("✨ Finalizing transcription...")
+
+            # Your existing intelligent punctuation logic remains the same
             punctuated_text = ""
             if words:
-                # Capitalize the first word, cleaning it first
                 punctuated_text += words[0].word.strip().capitalize()
-
                 for i in range(1, len(words)):
                     prev_word = words[i-1]
                     curr_word = words[i]
-                    
                     pause_duration = curr_word.start - prev_word.end
                     word_text = curr_word.word.strip()
                     
-                    # Define a pause threshold for a new sentence (e.g., 0.7 seconds)
                     if pause_duration > 0.7:
-                        # Clean up previous text before adding a period
                         punctuated_text = punctuated_text.rstrip(' ,.;')
                         punctuated_text += ". " + word_text.capitalize()
                     else:
                         punctuated_text += " " + word_text
                 
-                # Add a final period after cleaning up any trailing punctuation
                 punctuated_text = punctuated_text.rstrip(' ,.;')
                 punctuated_text += "."
 
             full_text = punctuated_text
-            # --- END OF NEW LOGIC ---
-
             output_format = 'srt' if command == '/subtitle' else 'txt'
             output_content = self._format_output(full_text.strip(), info, output_format)
             output_path = Path(f"{self.config.temp_dir}/transcript_{uuid.uuid4().hex[:6]}.{output_format}")
             output_path.write_text(output_content, encoding='utf-8')
             
+            processing_time = time.time() - start_time
             caption = (
-                f"✅ **Transcription Complete**\n\n"
-                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})\n"
-                f"**Model:** `{self.model_manager.current_model_name}`\n"
-                f"**Duration:** `{timedelta(seconds=int(info.duration))}`\n"
+                f"✅ **Transcription Complete**
+
+"
+                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})
+"
+                f"**Model:** `{self.model_manager.current_model_name}`
+"
+                f"**Duration:** `{timedelta(seconds=int(info.duration))}`
+"
+                f"**Processing Time:** `{processing_time:.1f}s`
+"
                 f"{'**Prompt:** Provided' if initial_prompt else ''}"
             ).strip()
             
             await message.reply_document(str(output_path), caption=caption, parse_mode=enums.ParseMode.MARKDOWN)
             await status_msg.delete()
             
-            processing_time = time.time() - start_time
             self.db.log_transcription(message.from_user.id, file_hash, self.model_manager.current_model_name, info.language, processing_time, file_size, info.duration)
             
         finally:
-            # Comprehensive cleanup
+            # Cleanup remains the same
             temp_path.unlink(missing_ok=True)
-            if 'wav_path' in locals() and Path(wav_path).exists(): Path(wav_path).unlink()
-            if 'output_path' in locals() and output_path.exists(): output_path.unlink()
-
+            if 'wav_path' in locals() and Path(wav_path).exists(): 
+                Path(wav_path).unlink()
+            if 'output_path' in locals() and output_path.exists(): 
+                output_path.unlink()
 
     async def _convert_to_wav(self, media_path: str) -> str:
         """Converts any media file to a standardized 16kHz mono WAV file using ffmpeg."""
@@ -520,9 +567,19 @@ class ColabWhisperBot:
         if process.returncode != 0: raise IOError(f"FFmpeg error: {stderr.decode()}")
         return output_path
 
-    async def _transcribe_audio_realtime(self, audio_path: str, language: Optional[str], initial_prompt: Optional[str]) -> AsyncGenerator[Tuple[Any, Any], None]:
-        """Transcribes with accuracy-focused settings and yields segments in real-time."""
-        # Hallmark settings with word-level timestamps enabled
+    async def _transcribe_audio_realtime(self, audio_path: str, language: Optional[str], initial_prompt: Optional[str], progress_callback=None) -> AsyncGenerator[Tuple[Any, Any], None]:
+        """Transcribes with accuracy-focused settings and yields segments in real-time with progress tracking."""
+        
+        # Get audio duration for progress calculation
+        import librosa
+        try:
+            audio_duration = librosa.get_duration(path=audio_path)  
+        except:
+            # Fallback using ffprobe if librosa fails
+            cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', audio_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            audio_duration = float(result.stdout.strip()) if result.stdout.strip() else 0
+        
         segments, info = self.model_manager.current_model.transcribe(
             audio_path,
             beam_size=5,
@@ -534,11 +591,19 @@ class ColabWhisperBot:
             compression_ratio_threshold=2.0,
             log_prob_threshold=-0.9,
             no_speech_threshold=0.6,
-            word_timestamps=True  # <-- KEY CHANGE: Enable word-level timestamps
+            word_timestamps=True
         )
+        
+        processed_time = 0
         for segment in segments:
+            processed_time = segment.end
+            progress_percent = min((processed_time / audio_duration) * 100, 100) if audio_duration > 0 else 0
+            
+            # Call progress callback if provided
+            if progress_callback:
+                await progress_callback(progress_percent, processed_time, audio_duration)
+                
             yield segment, info
-
 
 
     def _format_output(self, text: str, info, format_type: str) -> str:
