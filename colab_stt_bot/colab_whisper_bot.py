@@ -431,7 +431,7 @@ class ColabWhisperBot:
             await status_message.edit_text(f"❌ **Error:** {str(e)}")
 
     async def _process_media_file(self, message: Message, file_path: str, status_msg: Message, command: str, initial_prompt: Optional[str], language: Optional[str]):
-        """Core logic for processing a local media file."""
+        """Core logic for processing a local media file with intelligent punctuation."""
         start_time = time.time()
         temp_path = Path(file_path)
         try:
@@ -446,21 +446,41 @@ class ColabWhisperBot:
                 user_model = user_data.get('preferred_model', 'large-v3')
                 await self.model_manager.load_model(user_model)
 
-            await status_msg.edit_text("🧠 Transcribing... (this may take a while)")
+            await status_msg.edit_text("🧠 Transcribing & Punctuating...")
             
-            # --- REAL-TIME TRANSCRIPTION PROGRESS ---
-            full_text = ""
-            last_update = 0
-            async for segment, info in self._transcribe_audio_realtime(wav_path, language=language, initial_prompt=initial_prompt):
-                full_text += segment.text
-                if time.time() - last_update > 5:  # Update every 5 seconds
-                    progress_text = f"🧠 **Transcribing...**\n\n`{full_text[-200:]}...`"
-                    try:
-                        await status_msg.edit_text(progress_text)
-                        last_update = time.time()
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-            
+            # --- NEW: LOGIC FOR INTELLIGENT PUNCTUATION ---
+            words = []
+            info = None
+            async for segment, transcription_info in self._transcribe_audio_realtime(wav_path, language=language, initial_prompt=initial_prompt):
+                if info is None: info = transcription_info
+                for word in segment.words:
+                    words.append(word)
+
+            punctuated_text = ""
+            if words:
+                # Capitalize the first word
+                punctuated_text += words[0].word.strip().capitalize()
+
+                for i in range(1, len(words)):
+                    prev_word = words[i-1]
+                    curr_word = words[i]
+                    
+                    pause_duration = curr_word.start - prev_word.end
+                    
+                    # Define a pause threshold for a new sentence (e.g., 0.7 seconds)
+                    if pause_duration > 0.7:
+                        punctuated_text += "."
+                        punctuated_text += " " + curr_word.word.strip().capitalize()
+                    else:
+                        punctuated_text += " " + curr_word.word.strip()
+                
+                # Add a final period if it's missing
+                if not punctuated_text.endswith('.'):
+                    punctuated_text += "."
+
+            full_text = punctuated_text
+            # --- END OF NEW LOGIC ---
+
             output_format = 'srt' if command == '/subtitle' else 'txt'
             output_content = self._format_output(full_text.strip(), info, output_format)
             output_path = Path(f"{self.config.temp_dir}/transcript_{uuid.uuid4().hex[:6]}.{output_format}")
@@ -486,6 +506,7 @@ class ColabWhisperBot:
             if 'wav_path' in locals() and Path(wav_path).exists(): Path(wav_path).unlink()
             if 'output_path' in locals() and output_path.exists(): output_path.unlink()
 
+
     async def _convert_to_wav(self, media_path: str) -> str:
         """Converts any media file to a standardized 16kHz mono WAV file using ffmpeg."""
         output_path = f"{media_path}.wav"
@@ -498,7 +519,7 @@ class ColabWhisperBot:
 
     async def _transcribe_audio_realtime(self, audio_path: str, language: Optional[str], initial_prompt: Optional[str]) -> AsyncGenerator[Tuple[Any, Any], None]:
         """Transcribes with accuracy-focused settings and yields segments in real-time."""
-        # Hallmark settings with STRICTER anti-hallucination filters
+        # Hallmark settings with word-level timestamps enabled
         segments, info = self.model_manager.current_model.transcribe(
             audio_path,
             beam_size=5,
@@ -507,13 +528,14 @@ class ColabWhisperBot:
             language=language,
             initial_prompt=initial_prompt,
             temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            # --- STRONGER SETTINGS TO PREVENT REPETITION ---
-            compression_ratio_threshold=2.0,  # Lowered from 2.4 to be more strict
-            log_prob_threshold=-0.9,          # Raised from -1.0 to be more strict
-            no_speech_threshold=0.6
+            compression_ratio_threshold=2.0,
+            log_prob_threshold=-0.9,
+            no_speech_threshold=0.6,
+            word_timestamps=True  # <-- KEY CHANGE: Enable word-level timestamps
         )
         for segment in segments:
             yield segment, info
+
 
 
     def _format_output(self, text: str, info, format_type: str) -> str:
