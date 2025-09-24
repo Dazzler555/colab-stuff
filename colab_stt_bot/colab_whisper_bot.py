@@ -453,10 +453,10 @@ class ColabWhisperBot:
                 time_str = f"{int(processed_time//60):02d}:{int(processed_time%60):02d} / {int(total_duration//60):02d}:{int(total_duration%60):02d}"
                 
                 progress_text = (
-                    f"🧠 **Transcribing Audio**"
-                    f"{progress_bar} {percent:.1f}%"
-                    f"⏱️ **Time:** {time_str}"
-                    f"🤖 **Model:** `{self.model_manager.current_model_name}`"
+                    f"🧠 **Transcribing Audio**\n"
+                    f"{progress_bar} {percent:.1f}%\n"
+                    f"⏱️ **Time:** {time_str}\n"
+                    f"🤖 **Model:** `{self.model_manager.current_model_name}`\n"
                 )
                 
                 try:
@@ -526,12 +526,12 @@ class ColabWhisperBot:
             
             processing_time = time.time() - start_time
             caption = (
-                f"✅ **Transcription Complete**"
-                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})"
-                f"**Model:** `{self.model_manager.current_model_name}`"
-                f"**Duration:** `{timedelta(seconds=int(info.duration))}`"
-                f"**Processing Time:** `{processing_time:.1f}s`"
-                f"{'**Prompt:** Provided' if initial_prompt else ''}"
+                f"✅ **Transcription Complete**\n"
+                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})\n"
+                f"**Model:** `{self.model_manager.current_model_name}`\n"
+                f"**Duration:** `{timedelta(seconds=int(info.duration))}`\n"
+                f"**Processing Time:** `{processing_time:.1f}s`\n"
+                f"{'**Prompt:** Provided' if initial_prompt else ''}\n"
             ).strip()
             
             await message.reply_document(str(output_path), caption=caption, parse_mode=enums.ParseMode.MARKDOWN)
