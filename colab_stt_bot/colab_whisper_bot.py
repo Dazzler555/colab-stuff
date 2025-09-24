@@ -1,5 +1,5 @@
 # Enhanced Telegram Whisper Bot - Google Colab Version
-# Optimized for Google Colab with nested asyncio and local/gist config loading
+# Optimized for Google Colab with nested asyncio, prompting, and local/gist config loading
 
 import os
 import sys
@@ -282,12 +282,13 @@ class ColabModelManager:
             raise ValueError(f"Unknown model: {model_name}")
 
         print(f"🤖 Loading model: {model_name}...")
+        # THIS SECTION HANDLES CPU/GPU FALLBACK AUTOMATICALLY
         if torch.cuda.is_available():
             device, compute_type = "cuda", "float16"
             print("🔥 Using GPU (CUDA) acceleration.")
         else:
             device, compute_type = "cpu", "int8"
-            print("🖥️ Using CPU. Performance will be slower.")
+            print("🖥️ No GPU detected. Using CPU-optimized mode.")
 
         await self._cleanup_old_models()
         self.current_model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=str(self.model_dir))
@@ -337,15 +338,8 @@ class ColabWhisperBot:
         welcome_text = (
             f"🎤 **Enhanced Whisper Bot (Colab Edition)**\n\n"
             f"Hello {message.from_user.first_name}! I'm running on Google Colab with advanced transcription capabilities.\n\n"
-            "**✨ Features:**\n"
-            "• 🎯 High-accuracy transcription\n"
-            "• 📝 Multiple output formats (Text, SRT)\n"
-            "• 🌍 Translation support\n"
-            "• 📹 YouTube URL processing\n\n"
-            "**🚀 Quick Start:**\n"
-            "1. Upload an audio/video file or send a voice message.\n"
-            "2. Reply to it with `/transcribe` or `/subtitle`.\n"
-            "3. Use `/models` to select the best model for your needs.\n\n"
+            "**✨ New Feature: Prompting!**\n"
+            "Improve accuracy for medical or technical terms by providing a prompt. Example: `/transcribe A discussion about adenocarcinoma.`\n\n"
             "Use `/help` for a full list of commands!"
         )
         keyboard = InlineKeyboardMarkup([
@@ -359,19 +353,15 @@ class ColabWhisperBot:
             "📚 **Colab Whisper Bot - Help Guide**\n\n"
             "**🎵 Processing Commands (reply to a media file):**\n"
             "• `/transcribe` - Get the audio as plain text.\n"
-            "• `/subtitle` - Generate an `.srt` subtitle file.\n"
-            "• `/translate <lang_code>` - Transcribe and translate to another language (e.g., `/translate es` for Spanish).\n\n"
+            "• `/subtitle` - Generate an `.srt` subtitle file.\n\n"
+            "**💡 Improve Accuracy with Prompts!**\n"
+            "To correctly transcribe specific jargon, names, or technical terms, add them after the command.\n"
+            "  - *Example:* `/transcribe A meeting about Kubernetes and Docker.`\n"
+            "  - *Medical:* `/subtitle The patient has paroxysmal atrial fibrillation.`\n\n"
             "**⚙️ Bot Commands:**\n"
             "• `/models` - View and select a transcription model.\n"
             "• `/stats` - View your personal usage statistics.\n"
-            "• `/status` - Check the bot's current processing status.\n\n"
-            "**📱 Supported Media:**\n"
-            "• Audio files, video files, voice messages, and video notes.\n"
-            "• YouTube URLs (just send the link as a message).\n\n"
-            "**⚡ Colab Performance Tips:**\n"
-            "• **`base`**: Great balance of speed and accuracy (recommended).\n"
-            "• **`tiny`**: Fastest, for quick tests.\n"
-            "• **`small` / `medium`**: Higher accuracy for important files."
+            "• `/status` - Check the bot's current processing status."
         )
         await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
 
@@ -403,7 +393,7 @@ class ColabWhisperBot:
             models_text += f"├ Memory: {info['vram']}\n"
             models_text += f"├ Speed: {info['speed']}\n"
             models_text += f"└ Best for: {info['recommended']}\n\n"
-        models_text += "💡 Use `base` for a good balance, or `small` for higher accuracy if you have a GPU."
+        models_text += "💡 Use `small` or `medium` for better accuracy, especially for important content."
 
         buttons = [
             InlineKeyboardButton(f"{'⚡' if n in ['tiny', 'base'] else '🎯'} {n}", callback_data=f"select_model_{n}")
@@ -431,9 +421,13 @@ class ColabWhisperBot:
 
         user_id = message.from_user.id
         chat_id = message.chat.id
-        command = message.text.lower()
         
-        if not (command.startswith('/transcribe') or command.startswith('/subtitle') or command.startswith('/translate')):
+        # --- NEW: PARSE COMMAND AND PROMPT ---
+        command_parts = message.text.split(maxsplit=1)
+        command = command_parts[0].lower()
+        initial_prompt = command_parts[1] if len(command_parts) > 1 else None
+        
+        if not (command.startswith('/transcribe') or command.startswith('/subtitle')):
             return
 
         if not self.db.check_rate_limit(user_id, self.config.rate_limit_requests, self.config.rate_limit_window):
@@ -463,20 +457,11 @@ class ColabWhisperBot:
                 user_data = self.db.get_user(user_id)
                 await self.model_manager.load_model(user_data['preferred_model'] if user_data else 'base')
 
-            # Transcribe
+            # Transcribe (with prompt)
             await self._update_status(status_message, "👂 Transcribing...", 60)
-            transcription, lang, ptime, duration = await self._transcribe_audio(audio_path)
+            transcription, lang, ptime, duration = await self._transcribe_audio(audio_path, initial_prompt=initial_prompt)
             if transcription is None: raise ValueError("Transcription process failed.")
             
-            # Translate if needed
-            target_lang = None
-            if command.startswith('/translate'):
-                parts = command.split()
-                if len(parts) > 1:
-                    target_lang = parts[1]
-                    # This is a placeholder for actual translation logic
-                    transcription = f"[Translated to {target_lang}] {transcription}"
-
             # Prepare output
             await self._update_status(status_message, "📄 Generating output...", 95)
             output_content = self._format_output(transcription, duration, '/subtitle' in command)
@@ -491,7 +476,7 @@ class ColabWhisperBot:
                 f"🗣️ **Language**: `{lang}`\n"
                 f"⏱️ **Time**: `{ptime:.1f}s`\n"
                 f"🤖 **Model**: `{self.model_manager.current_model_name}`\n"
-                f"{f'🌍 **Translated to**: `{target_lang}`' if target_lang else ''}"
+                f"{'📝 **Prompt Used**' if initial_prompt else ''}"
             )
             await client.send_document(chat_id, document=str(output_path), caption=caption,
                                        parse_mode=enums.ParseMode.MARKDOWN,
@@ -579,10 +564,19 @@ class ColabWhisperBot:
         input_path.unlink()
         return str(output_path)
 
-    async def _transcribe_audio(self, audio_path: str):
+    # --- NEW: ACCEPTS AN INITIAL_PROMPT ---
+    async def _transcribe_audio(self, audio_path: str, initial_prompt: Optional[str] = None):
+        """Transcribes audio using the loaded model, with optional prompting."""
         start_time = time.time()
         duration = await self._get_audio_duration(audio_path)
-        segments, info = self.model_manager.current_model.transcribe(audio_path, beam_size=5, vad_filter=True)
+        
+        segments, info = self.model_manager.current_model.transcribe(
+            audio_path,
+            beam_size=5,
+            vad_filter=True, # Voice Activity Detection is enabled here
+            initial_prompt=initial_prompt # The new prompt is used here
+        )
+        
         transcription = " ".join(seg.text.strip() for seg in segments)
         processing_time = time.time() - start_time
         return transcription, info.language, processing_time, duration
@@ -608,7 +602,6 @@ class ColabWhisperBot:
         ms = int((seconds % 1) * 1000)
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    # THIS METHOD IS MODIFIED
     async def run(self):
         """Starts the bot client and prints status."""
         print("🚀 Starting Bot Client...")
@@ -619,7 +612,6 @@ class ColabWhisperBot:
 
 
 # --- Main Execution ---
-# THIS FUNCTION IS MODIFIED
 async def main():
     """Initializes and runs the bot, handling the main lifecycle."""
     print("🔥 Enhanced Telegram Whisper Bot - Colab Edition")
@@ -657,3 +649,4 @@ if __name__ == "__main__":
     
     # Run the main asynchronous function
     asyncio.run(main())
+
