@@ -1,9 +1,10 @@
 # Enhanced Telegram Whisper Bot - Google Colab Version
-# Optimized for Google Colab with nested asyncio, prompting, and local/gist config loading
+# v4: Complete, unabridged script with prompting, language selection, and accuracy enhancements.
 
 import os
 import sys
 import json
+import re
 import asyncio
 import logging
 import sqlite3
@@ -77,11 +78,6 @@ class ColabBotConfig:
     rate_limit_window: int = 3600  # 1 hour
     admin_users: List[int] = None
     allowed_users: List[int] = None
-    log_level: str = "INFO"
-    enable_translation: bool = True
-    enable_voice_messages: bool = True
-    auto_delete_files: bool = True
-    delete_timeout: int = 300  # 5 minutes
 
     def __post_init__(self):
         if self.admin_users is None:
@@ -117,7 +113,6 @@ def get_manual_config() -> ColabBotConfig:
     api_id = input("Enter your Telegram API ID: ")
     api_hash = input("Enter your Telegram API Hash: ")
     bot_token = input("Enter your Bot Token: ")
-    gist_url = input("Enter Gist URL for config updates (optional): ") or ""
     admin_input = input("Enter admin user IDs (comma-separated, optional): ")
     admin_users = [int(x.strip()) for x in admin_input.split(",") if x.strip().isdigit()]
 
@@ -125,7 +120,6 @@ def get_manual_config() -> ColabBotConfig:
         api_id=int(api_id),
         api_hash=api_hash,
         bot_token=bot_token,
-        gist_url=gist_url,
         admin_users=admin_users
     )
 
@@ -133,7 +127,6 @@ async def initialize_config() -> ColabBotConfig:
     """Initialize configuration, prioritizing local file, then Gist, then manual."""
     local_config_path = "/content/colab_gist_config_template.json"
 
-    # 1. Try to load from local file first
     if os.path.exists(local_config_path):
         print(f"✅ Found local config file: {local_config_path}")
         try:
@@ -144,7 +137,6 @@ async def initialize_config() -> ColabBotConfig:
         except Exception as e:
             print(f"⚠️ Failed to load from local config file: {e}")
 
-    # 2. Fallback to Gist URL
     gist_url = os.environ.get('CONFIG_GIST_URL') or input("Enter Config Gist URL (or press Enter for manual setup): ")
     if gist_url:
         try:
@@ -155,7 +147,6 @@ async def initialize_config() -> ColabBotConfig:
         except Exception as e:
             print(f"⚠️ Failed to load from gist: {e}")
 
-    # 3. Fallback to manual configuration
     print("💡 No local file or Gist URL found, proceeding with manual setup.")
     return get_manual_config()
 
@@ -173,10 +164,9 @@ class ColabDatabaseManager:
                 conn.executescript("""
                     CREATE TABLE IF NOT EXISTS users (
                         user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
-                        language_code TEXT DEFAULT 'auto', preferred_model TEXT DEFAULT 'base',
-                        translate_to TEXT DEFAULT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_premium BOOLEAN DEFAULT FALSE,
-                        usage_count INTEGER DEFAULT 0
+                        preferred_model TEXT DEFAULT 'large-v2',
+                        usage_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     );
                     CREATE TABLE IF NOT EXISTS transcriptions (
                         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, file_hash TEXT,
@@ -184,15 +174,10 @@ class ColabDatabaseManager:
                         file_size INTEGER, duration REAL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (user_id) REFERENCES users (user_id)
                     );
-                    CREATE TABLE IF NOT EXISTS rate_limits (
-                        user_id INTEGER, timestamp TIMESTAMP, request_count INTEGER DEFAULT 1,
-                        PRIMARY KEY (user_id, timestamp)
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_rate_limits_user_time ON rate_limits (user_id, timestamp);
                 """)
             print("✅ Database initialized successfully.")
         except Exception as e:
-            logging.error(f"Database initialization error: {e}")
+            logging.error(f"Database initialization error: {e}", exc_info=True)
             raise
 
     def get_user(self, user_id: int) -> Optional[Dict]:
@@ -227,28 +212,6 @@ class ColabDatabaseManager:
         except Exception as e:
             logging.error(f"Error updating setting '{key}' for user {user_id}: {e}")
 
-    def check_rate_limit(self, user_id: int, max_requests: int, window_seconds: int) -> bool:
-        try:
-            cutoff_time = datetime.now() - timedelta(seconds=window_seconds)
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(
-                    "SELECT SUM(request_count) FROM rate_limits WHERE user_id = ? AND timestamp > ?",
-                    (user_id, cutoff_time)
-                )
-                current_requests = (cursor.fetchone() or [0])[0] or 0
-                if current_requests >= max_requests:
-                    return False
-
-                now = datetime.now().replace(second=0, microsecond=0)
-                conn.execute("""
-                    INSERT INTO rate_limits (user_id, timestamp, request_count) VALUES (?, ?, 1)
-                    ON CONFLICT(user_id, timestamp) DO UPDATE SET request_count = request_count + 1;
-                """, (user_id, now))
-                return True
-        except Exception as e:
-            logging.error(f"Rate limit check error: {e}")
-            return True
-
     def log_transcription(self, user_id: int, file_hash: str, model: str, lang: str, ptime: float, fsize: int, dur: float):
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -257,7 +220,7 @@ class ColabDatabaseManager:
                                                 processing_time, file_size, duration)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (user_id, file_hash, model, lang, ptime, fsize, dur))
-                conn.execute("UPDATE users SET usage_count = usage_count + 1 WHERE user_id = ?", (user_id,))
+                conn.execute("UPDATE users SET usage_count = usage_count + 1, last_active = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
         except Exception as e:
             logging.error(f"Error logging transcription: {e}")
 
@@ -270,11 +233,11 @@ class ColabModelManager:
         self.current_model = None
         self.current_model_name = None
         self.model_info = {
-            "tiny": {"vram": "~0.8GB", "speed": "~32x", "recommended": "Speed"},
-            "base": {"vram": "~1GB", "speed": "~16x", "recommended": "Balanced"},
-            "small": {"vram": "~1.4GB", "speed": "~6x", "recommended": "Quality"},
-            "medium": {"vram": "~2.7GB", "speed": "~2x", "recommended": "High Quality"},
-            "large-v2": {"vram": "~4.3GB", "speed": "~1x", "recommended": "Best Quality"},
+            "tiny": "Fastest, low accuracy",
+            "base": "Fast, balanced accuracy",
+            "small": "Good balance of speed and accuracy",
+            "medium": "High accuracy, slower",
+            "large-v2": "Best accuracy, slowest",
         }
 
     async def load_model(self, model_name: str) -> WhisperModel:
@@ -282,7 +245,6 @@ class ColabModelManager:
             raise ValueError(f"Unknown model: {model_name}")
 
         print(f"🤖 Loading model: {model_name}...")
-        # THIS SECTION HANDLES CPU/GPU FALLBACK AUTOMATICALLY
         if torch.cuda.is_available():
             device, compute_type = "cuda", "float16"
             print("🔥 Using GPU (CUDA) acceleration.")
@@ -290,23 +252,10 @@ class ColabModelManager:
             device, compute_type = "cpu", "int8"
             print("🖥️ No GPU detected. Using CPU-optimized mode.")
 
-        await self._cleanup_old_models()
         self.current_model = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=str(self.model_dir))
         self.current_model_name = model_name
         print(f"✅ Model '{model_name}' loaded successfully on {device}.")
         return self.current_model
-
-    async def _cleanup_old_models(self):
-        try:
-            model_dirs = [d for d in self.model_dir.iterdir() if d.is_dir() and 'models--' in d.name]
-            if len(model_dirs) > 1:
-                print("🧹 Cleaning up old models to save space...")
-                model_dirs.sort(key=lambda x: x.stat().st_mtime)
-                for old_dir in model_dirs[:-1]:
-                    shutil.rmtree(old_dir)
-                    print(f"  -> Removed: {old_dir.name}")
-        except Exception as e:
-            logging.warning(f"Model cleanup warning: {e}")
 
 # --- Main Bot Class ---
 class ColabWhisperBot:
@@ -315,184 +264,75 @@ class ColabWhisperBot:
         self.db = ColabDatabaseManager(config.database_path)
         self.model_manager = ColabModelManager(config.model_dir)
         self.processing_status = {}
-
-        for directory in [config.model_dir, config.download_dir, config.temp_dir]:
-            Path(directory).mkdir(exist_ok=True, parents=True)
-
-        self.app = Client("colab_whisper_bot", api_id=config.api_id, api_hash=config.api_hash,
-                          bot_token=config.bot_token, workdir="/content")
+        self.app = Client("colab_whisper_bot", api_id=config.api_id, api_hash=config.api_hash, bot_token=config.bot_token, workdir="/content")
         self._setup_handlers()
         print("🤖 Bot class initialized successfully!")
 
     def _setup_handlers(self):
         self.app.on_message(filters.command("start"))(self.handle_start)
         self.app.on_message(filters.command("help"))(self.handle_help)
-        self.app.on_message(filters.command("status"))(self.handle_status)
         self.app.on_message(filters.command("models"))(self.handle_models)
         self.app.on_message(filters.command("stats"))(self.handle_stats)
-        self.app.on_message(filters.reply & (filters.audio | filters.video | filters.voice | filters.video_note | filters.document | filters.text))(self.handle_media_processing)
+        self.app.on_message(filters.reply & filters.text & filters.regex(r"^/(transcribe|subtitle)"))(self.handle_media_processing)
         self.app.on_callback_query()(self.handle_callbacks)
 
     async def handle_start(self, client: Client, message: Message):
         self.db.create_or_update_user(message.from_user)
         welcome_text = (
-            f"🎤 **Enhanced Whisper Bot (Colab Edition)**\n\n"
-            f"Hello {message.from_user.first_name}! I'm running on Google Colab with advanced transcription capabilities.\n\n"
-            "**✨ New Feature: Prompting!**\n"
-            "Improve accuracy for medical or technical terms by providing a prompt. Example: `/transcribe A discussion about adenocarcinoma.`\n\n"
-            "Use `/help` for a full list of commands!"
+            f"🎤 **Whisper Transcription Bot**\n\n"
+            f"Hello {message.from_user.first_name}! To get started, simply reply to an audio or video file with `/transcribe`.\n\n"
+            "Use `/help` to see all available features for improving accuracy."
         )
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🤖 Models", callback_data="models"), InlineKeyboardButton("📚 Help", callback_data="help")],
-            [InlineKeyboardButton("📊 My Stats", callback_data="stats")]
-        ])
-        await message.reply_text(welcome_text, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=keyboard)
+        await message.reply_text(welcome_text, parse_mode=enums.ParseMode.MARKDOWN)
 
     async def handle_help(self, client: Client, message: Message):
         help_text = (
-            "📚 **Colab Whisper Bot - Help Guide**\n\n"
-            "**🎵 Processing Commands (reply to a media file):**\n"
-            "• `/transcribe` - Get the audio as plain text.\n"
-            "• `/subtitle` - Generate an `.srt` subtitle file.\n\n"
-            "**💡 Improve Accuracy with Prompts!**\n"
-            "To correctly transcribe specific jargon, names, or technical terms, add them after the command.\n"
-            "  - *Example:* `/transcribe A meeting about Kubernetes and Docker.`\n"
-            "  - *Medical:* `/subtitle The patient has paroxysmal atrial fibrillation.`\n\n"
-            "**⚙️ Bot Commands:**\n"
-            "• `/models` - View and select a transcription model.\n"
-            "• `/stats` - View your personal usage statistics.\n"
-            "• `/status` - Check the bot's current processing status."
+            "📚 **Bot Help Guide**\n\n"
+            "**How to Transcribe Audio**\n"
+            "1. Reply to an audio, video, or voice message.\n"
+            "2. Use one of the commands below:\n\n"
+            "🔹 `/transcribe`\n"
+            "   Gets the plain text transcription.\n\n"
+            "🔹 `/subtitle`\n"
+            "   Generates an `.srt` subtitle file.\n\n"
+            "--- \n"
+            "**💡 Pro Tips for Maximum Accuracy:**\n\n"
+            "1. **Add a Prompt:** Guide the model by providing context, jargon, or names. This is the most powerful tool for accuracy.\n"
+            "   *Example:* `/transcribe A discussion about adenocarcinoma and metformin.`\n\n"
+            "2. **Set the Language:** Force a specific language if auto-detect struggles with accents.\n"
+            "   *Example:* `/subtitle lang=en Your prompt here...`\n\n"
+            "--- \n"
+            "**Other Commands:**\n"
+            "• `/models` - Choose a different transcription model (`large-v2` is best).\n"
+            "• `/stats` - View your usage statistics."
         )
         await message.reply_text(help_text, parse_mode=enums.ParseMode.MARKDOWN)
 
-    async def handle_status(self, client: Client, message: Message):
-        status = self.processing_status.get(message.chat.id)
-        if status:
-            elapsed = time.time() - status.get('start_time', time.time())
-            status_text = (
-                f"📊 **Current Task Status**\n\n"
-                f"🔄 **Process**: {status.get('message', 'Working...')}\n"
-                f"📈 **Progress**: {status.get('progress', 0):.1f}%\n"
-                f"⏱️ **Elapsed Time**: {elapsed:.1f}s"
-            )
-        else:
-            status_text = (
-                f"✅ **Bot Status**\n\n"
-                f"🤖 **Model Loaded**: `{self.model_manager.current_model_name or 'None'}`\n"
-                f"💾 **Device**: `{'GPU' if torch.cuda.is_available() else 'CPU'}`\n"
-                f"🔄 **Active Processes**: None\n\n"
-                "I'm ready to process your media!"
-            )
-        await message.reply_text(status_text, parse_mode=enums.ParseMode.MARKDOWN)
-
     async def handle_models(self, client: Client, message: Message):
-        models_text = "🤖 **Available Models (Colab Optimized)**\n\n"
-        for name, info in self.model_manager.model_info.items():
-            emoji = "⚡" if name in ["tiny", "base"] else "🎯"
-            models_text += f"{emoji} **{name}**\n"
-            models_text += f"├ Memory: {info['vram']}\n"
-            models_text += f"├ Speed: {info['speed']}\n"
-            models_text += f"└ Best for: {info['recommended']}\n\n"
-        models_text += "💡 Use `small` or `medium` for better accuracy, especially for important content."
-
         buttons = [
-            InlineKeyboardButton(f"{'⚡' if n in ['tiny', 'base'] else '🎯'} {n}", callback_data=f"select_model_{n}")
-            for n in self.model_manager.model_info.keys()
+            InlineKeyboardButton(f"{name} ({desc})", callback_data=f"select_model_{name}")
+            for name, desc in self.model_manager.model_info.items()
         ]
-        keyboard = InlineKeyboardMarkup([buttons[:3], buttons[3:]])
-        await message.reply_text(models_text, parse_mode=enums.ParseMode.MARKDOWN, reply_markup=keyboard)
+        keyboard = InlineKeyboardMarkup([buttons[i:i+1] for i in range(0, len(buttons))]) # One button per row
+        await message.reply_text(
+            "**Select a Transcription Model:**\n\n"
+            "- **`large-v2`**: Most accurate, recommended for best results.\n"
+            "- **`small`/`medium`**: Good balance for faster processing.\n"
+            "- **`base`/`tiny`**: Fastest, for non-critical tasks.",
+            reply_markup=keyboard
+        )
 
     async def handle_stats(self, client: Client, message: Message):
         user_data = self.db.get_user(message.from_user.id)
         if not user_data:
             return await message.reply_text("❌ No statistics available yet. Use the bot first!")
-
         stats_text = (
             f"📊 **Your Statistics**\n\n"
-            f"👤 **User ID**: `{user_data['user_id']}`\n"
-            f"📈 **Total Transcriptions**: `{user_data['usage_count']}`\n"
-            f"🗓️ **Member Since**: `{user_data['created_at'][:10]}`\n"
-            f"🤖 **Preferred Model**: `{user_data['preferred_model']}`"
+            f"👤 **User**: `{message.from_user.first_name}`\n"
+            f"📈 **Total Transcriptions**: `{user_data.get('usage_count', 0)}`\n"
+            f"🤖 **Preferred Model**: `{user_data.get('preferred_model', 'large-v2')}`"
         )
         await message.reply_text(stats_text, parse_mode=enums.ParseMode.MARKDOWN)
-
-    async def handle_media_processing(self, client: Client, message: Message):
-        if not message.reply_to_message: return
-
-        user_id = message.from_user.id
-        chat_id = message.chat.id
-        
-        # --- NEW: PARSE COMMAND AND PROMPT ---
-        command_parts = message.text.split(maxsplit=1)
-        command = command_parts[0].lower()
-        initial_prompt = command_parts[1] if len(command_parts) > 1 else None
-        
-        if not (command.startswith('/transcribe') or command.startswith('/subtitle')):
-            return
-
-        if not self.db.check_rate_limit(user_id, self.config.rate_limit_requests, self.config.rate_limit_window):
-            return await message.reply_text("⏱️ Rate limit exceeded. Please wait a bit before making new requests.")
-
-        if chat_id in self.processing_status:
-            return await message.reply_text("⚠️ Please wait for the current process to finish before starting a new one.")
-
-        status_message = await message.reply_text("⏳ **Initializing...**", parse_mode=enums.ParseMode.MARKDOWN)
-        self.processing_status[chat_id] = {"start_time": time.time()}
-
-        try:
-            # Download
-            await self._update_status(status_message, "📥 Downloading media...", 10)
-            media_info = await self._download_media(client, message.reply_to_message)
-            if not media_info: raise ValueError("Failed to download or invalid file.")
-            file_path, file_hash, file_size = media_info
-
-            # Convert
-            await self._update_status(status_message, "🔄 Converting to audio...", 30)
-            audio_path = await self._convert_to_wav(file_path)
-            if not audio_path: raise ValueError("Audio conversion failed.")
-
-            # Load model
-            if not self.model_manager.current_model:
-                await self._update_status(status_message, "🤖 Loading model...", 40)
-                user_data = self.db.get_user(user_id)
-                await self.model_manager.load_model(user_data['preferred_model'] if user_data else 'base')
-
-            # Transcribe (with prompt)
-            await self._update_status(status_message, "👂 Transcribing...", 60)
-            transcription, lang, ptime, duration = await self._transcribe_audio(audio_path, initial_prompt=initial_prompt)
-            if transcription is None: raise ValueError("Transcription process failed.")
-            
-            # Prepare output
-            await self._update_status(status_message, "📄 Generating output...", 95)
-            output_content = self._format_output(transcription, duration, '/subtitle' in command)
-            output_filename = f"transcript_{uuid.uuid4().hex[:6]}.{'srt' if '/subtitle' in command else 'txt'}"
-            output_path = Path(self.config.temp_dir) / output_filename
-            async with aiofiles.open(output_path, 'w', encoding='utf-8') as f:
-                await f.write(output_content)
-
-            # Send results
-            caption = (
-                f"✅ **Processing Complete!**\n\n"
-                f"🗣️ **Language**: `{lang}`\n"
-                f"⏱️ **Time**: `{ptime:.1f}s`\n"
-                f"🤖 **Model**: `{self.model_manager.current_model_name}`\n"
-                f"{'📝 **Prompt Used**' if initial_prompt else ''}"
-            )
-            await client.send_document(chat_id, document=str(output_path), caption=caption,
-                                       parse_mode=enums.ParseMode.MARKDOWN,
-                                       reply_to_message_id=message.reply_to_message.id)
-            await status_message.delete()
-
-            self.db.log_transcription(user_id, file_hash, self.model_manager.current_model_name, lang, ptime, file_size, duration)
-            for p in [file_path, audio_path, output_path]:
-                if p and Path(p).exists(): Path(p).unlink()
-
-        except Exception as e:
-            logging.error(f"Processing error: {e}", exc_info=True)
-            await status_message.edit_text(f"❌ **Error:** {str(e)}", parse_mode=enums.ParseMode.MARKDOWN)
-        finally:
-            if chat_id in self.processing_status:
-                del self.processing_status[chat_id]
 
     async def handle_callbacks(self, client: Client, query: CallbackQuery):
         data = query.data
@@ -505,102 +345,106 @@ class ColabWhisperBot:
                 await query.edit_message_text(f"✅ Model **{model_name}** is now active!", parse_mode=enums.ParseMode.MARKDOWN)
             except Exception as e:
                 await query.edit_message_text(f"❌ Failed to load model: {e}", parse_mode=enums.ParseMode.MARKDOWN)
-        elif data == "help":
-            await query.answer()
-            await self.handle_help(client, query.message)
-        elif data == "models":
-            await query.answer()
-            await self.handle_models(client, query.message)
-        elif data == "stats":
-            await query.answer()
-            await self.handle_stats(client, query.message)
+        else:
+            await query.answer("Unknown action.", show_alert=True)
 
-    async def _update_status(self, msg: Message, text: str, progress: int):
-        self.processing_status[msg.chat.id].update({"message": text, "progress": progress})
+    async def handle_media_processing(self, client: Client, message: Message):
+        # --- PARSE COMMAND, LANGUAGE, AND PROMPT ---
+        text = message.text
+        command_match = re.match(r"/(transcribe|subtitle)", text)
+        command = command_match.group(0)
+        remaining_text = text[len(command):].strip()
+        
+        lang_match = re.match(r"lang=(\w{2,3})\s*", remaining_text)
+        language = None
+        if lang_match:
+            language = lang_match.group(1)
+            initial_prompt = remaining_text[len(lang_match.group(0)):].strip()
+        else:
+            initial_prompt = remaining_text.strip()
+        initial_prompt = initial_prompt or None
+
+        status_message = await message.reply_text("⏳ Initializing...", parse_mode=enums.ParseMode.MARKDOWN)
+        
         try:
-            await msg.edit_text(f"**{text}** ({progress}%)", parse_mode=enums.ParseMode.MARKDOWN)
-        except Exception:
-            pass
+            media_msg = message.reply_to_message
+            media = media_msg.audio or media_msg.video or media_msg.voice or media_msg.video_note or media_msg.document
+            if not media:
+                raise ValueError("Please reply to a valid audio, video, or voice message.")
 
-    async def _download_media(self, client: Client, message: Message):
-        media = message.audio or message.video or message.voice or message.video_note or message.document
-        if not media:
-            if message.text and ("youtube.com" in message.text or "youtu.be" in message.text):
-                return await self._download_youtube(message.text.strip())
-            return None
+            await status_message.edit_text("📥 Downloading...")
+            temp_path = await client.download_media(media, file_name=f"/content/temp/{uuid.uuid4()}")
+            file_hash = hashlib.md5(Path(temp_path).read_bytes()).hexdigest()
+            file_size = os.path.getsize(temp_path)
+            
+            await status_message.edit_text("🔄 Converting to WAV audio...")
+            wav_path = await self._convert_to_wav(temp_path)
 
-        if hasattr(media, 'file_size') and media.file_size > self.config.max_file_size:
-            raise ValueError(f"File is too large ({media.file_size / 1024**2:.1f}MB). Max is {self.config.max_file_size / 1024**2}MB.")
+            if not self.model_manager.current_model:
+                user_data = self.db.get_user(message.from_user.id)
+                user_model = user_data.get('preferred_model', 'large-v2')
+                await self.model_manager.load_model(user_model)
 
-        temp_path = await client.download_media(message, file_name=f"{self.config.temp_dir}/{uuid.uuid4()}")
-        file_hash = hashlib.md5(Path(temp_path).read_bytes()).hexdigest()
-        file_size = os.path.getsize(temp_path)
-        return temp_path, file_hash, file_size
+            await status_message.edit_text("🧠 Transcribing... (this may take a while with large models)")
+            transcription, info = await self._transcribe_audio(wav_path, language=language, initial_prompt=initial_prompt)
+            
+            output_format = 'srt' if command == '/subtitle' else 'txt'
+            output_content = self._format_output(transcription, info.duration, output_format)
+            output_path = Path(f"/content/temp/transcript_{uuid.uuid4().hex[:6]}.{output_format}")
+            output_path.write_text(output_content, encoding='utf-8')
+            
+            caption = (
+                f"✅ **Transcription Complete**\n\n"
+                f"**Language:** `{info.language}` (Confidence: {info.language_probability:.2f})\n"
+                f"**Model:** `{self.model_manager.current_model_name}`\n"
+                f"{'**Prompt:** Provided' if initial_prompt else ''}"
+            ).strip()
+            
+            await client.send_document(message.chat.id, str(output_path), caption=caption, parse_mode=enums.ParseMode.MARKDOWN)
+            await status_message.delete()
+            
+            self.db.log_transcription(message.from_user.id, file_hash, self.model_manager.current_model_name, info.language, info.duration, file_size, info.duration)
+            
+            # Cleanup
+            Path(temp_path).unlink(missing_ok=True)
+            Path(wav_path).unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
 
-    async def _download_youtube(self, url: str):
-        temp_id = uuid.uuid4().hex
-        output_path = f"{self.config.temp_dir}/{temp_id}.%(ext)s"
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best', 'outtmpl': output_path,
-            'quiet': True, 'no_warnings': True, 'noplaylist': True,
-            'max_filesize': self.config.max_file_size
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            downloaded_path = ydl.prepare_filename(info)
-            file_size = os.path.getsize(downloaded_path)
-            file_hash = hashlib.md5(Path(downloaded_path).read_bytes()).hexdigest()
-            return downloaded_path, file_hash, file_size
-        return None
+        except Exception as e:
+            logging.error(f"Processing error: {e}", exc_info=True)
+            await status_message.edit_text(f"❌ **Error:** {str(e)}")
 
-    async def _convert_to_wav(self, media_path: str):
-        input_path = Path(media_path)
-        output_path = input_path.with_suffix('.wav')
-        cmd = ['ffmpeg', '-y', '-i', str(input_path), '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', str(output_path)]
+    async def _convert_to_wav(self, media_path: str) -> str:
+        output_path = f"{media_path}.wav"
+        cmd = ['ffmpeg', '-y', '-i', media_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', output_path]
         process = await asyncio.create_subprocess_exec(*cmd, stderr=asyncio.subprocess.PIPE)
         _, stderr = await process.communicate()
-        if process.returncode != 0:
-            raise IOError(f"FFmpeg error: {stderr.decode()}")
-        input_path.unlink()
-        return str(output_path)
+        if process.returncode != 0: raise IOError(f"FFmpeg error: {stderr.decode()}")
+        return output_path
 
-    # --- NEW: ACCEPTS AN INITIAL_PROMPT ---
-    async def _transcribe_audio(self, audio_path: str, initial_prompt: Optional[str] = None):
-        """Transcribes audio using the loaded model, with optional prompting."""
-        start_time = time.time()
-        duration = await self._get_audio_duration(audio_path)
-        
+    async def _transcribe_audio(self, audio_path: str, language: Optional[str], initial_prompt: Optional[str]):
+        """Transcribes with accuracy-focused settings."""
         segments, info = self.model_manager.current_model.transcribe(
             audio_path,
-            beam_size=5,
-            vad_filter=True, # Voice Activity Detection is enabled here
-            initial_prompt=initial_prompt # The new prompt is used here
+            beam_size=10,
+            vad_filter=True,
+            language=language,
+            initial_prompt=initial_prompt
         )
-        
-        transcription = " ".join(seg.text.strip() for seg in segments)
-        processing_time = time.time() - start_time
-        return transcription, info.language, processing_time, duration
+        full_text = " ".join(seg.text.strip() for seg in segments)
+        return full_text, info
 
-    async def _get_audio_duration(self, audio_path: str) -> float:
-        try:
-            cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', audio_path]
-            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE)
-            stdout, _ = await process.communicate()
-            return float(stdout.decode().strip())
-        except Exception:
-            return 0.0
-
-    def _format_output(self, text: str, duration: float, is_srt: bool) -> str:
-        if is_srt:
-            return f"1\n00:00:00,000 --> {self._seconds_to_srt_time(duration)}\n{text}"
+    def _format_output(self, text: str, duration: float, format_type: str) -> str:
+        """Formats the transcription into plain text or SRT."""
+        if format_type == 'srt':
+            def to_srt_time(seconds: float) -> str:
+                h = int(seconds // 3600)
+                m = int((seconds % 3600) // 60)
+                s = int(seconds % 60)
+                ms = int((seconds % 1) * 1000)
+                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+            return f"1\n00:00:00,000 --> {to_srt_time(duration)}\n{text}"
         return text
-
-    def _seconds_to_srt_time(self, seconds: float) -> str:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        ms = int((seconds % 1) * 1000)
-        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     async def run(self):
         """Starts the bot client and prints status."""
@@ -610,28 +454,20 @@ class ColabWhisperBot:
         print(f"✅ Bot started as @{me.username}!")
         print("🤖 Send /start to begin. Keep this Colab cell running.")
 
-
 # --- Main Execution ---
 async def main():
     """Initializes and runs the bot, handling the main lifecycle."""
     print("🔥 Enhanced Telegram Whisper Bot - Colab Edition")
-    print("=" * 60)
     bot_instance = None
     try:
-        # Initialize configuration and bot instance
         config = await initialize_config()
         bot_instance = ColabWhisperBot(config)
-
-        # Start the bot
         await bot_instance.run()
-
-        # Keep the script running indefinitely until interrupted
         await asyncio.Event().wait()
-
     except (KeyboardInterrupt, SystemExit):
         print("\n🛑 Bot shutdown requested.")
     except Exception as e:
-        print(f"❌ A critical startup error occurred: {e}")
+        print(f"❌ A critical startup error occurred: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
     finally:
@@ -641,12 +477,6 @@ async def main():
             print("✅ Bot stopped.")
 
 if __name__ == "__main__":
-    try:
-        import google.colab
-        print("✅ Google Colab environment detected.")
-    except ImportError:
-        print("⚠️ Not running in a standard Google Colab environment.")
-    
-    # Run the main asynchronous function
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     asyncio.run(main())
 
