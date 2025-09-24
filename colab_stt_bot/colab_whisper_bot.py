@@ -453,13 +453,9 @@ class ColabWhisperBot:
                 time_str = f"{int(processed_time//60):02d}:{int(processed_time%60):02d} / {int(total_duration//60):02d}:{int(total_duration%60):02d}"
                 
                 progress_text = (
-                    f"🧠 **Transcribing Audio**
-
-"
-                    f"{progress_bar} {percent:.1f}%
-"
-                    f"⏱️ **Time:** {time_str}
-"
+                    f"🧠 **Transcribing Audio**"
+                    f"{progress_bar} {percent:.1f}%"
+                    f"⏱️ **Time:** {time_str}"
                     f"🤖 **Model:** `{self.model_manager.current_model_name}`"
                 )
                 
